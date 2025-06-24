@@ -1,0 +1,1397 @@
+import { pgTable, text, serial, integer, boolean, timestamp } from "drizzle-orm/pg-core";
+import { createInsertSchema } from "drizzle-zod";
+import { z } from "zod";
+
+export const users = pgTable("users", {
+  id: serial("id").primaryKey(),
+  username: text("username").notNull().unique(),
+  email: text("email").notNull().unique(),
+  password: text("password").notNull(),
+  profileImage: text("profile_image"),
+  isOnline: boolean("is_online").default(false),
+  lastSeen: timestamp("last_seen").defaultNow(),
+});
+
+export const messages = pgTable("messages", {
+  id: serial("id").primaryKey(),
+  senderId: integer("sender_id").notNull().references(() => users.id),
+  receiverId: integer("receiver_id").notNull().references(() => users.id),
+  content: text("content").notNull(),
+  timestamp: timestamp("timestamp").defaultNow(),
+  isRead: boolean("is_read").default(false),
+  messageType: text("message_type").default("text"), // text, image
+});
+
+export const insertUserSchema = createInsertSchema(users).pick({
+  username: true,
+  email: true,
+  password: true,
+  profileImage: true,
+});
+
+export const insertMessageSchema = createInsertSchema(messages).pick({
+  receiverId: true,
+  content: true,
+  messageType: true,
+});
+
+export const loginSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(1),
+});
+
+export type InsertUser = z.infer<typeof insertUserSchema>;
+export type User = typeof users.$inferSelect;
+export type InsertMessage = z.infer<typeof insertMessageSchema>;
+export type Message = typeof messages.$inferSelect;
+export type LoginRequest = z.infer<typeof loginSchema>;
+
+export type MessageWithSender = Message & {
+  sender: Pick<User, 'id' | 'username' | 'profileImage'>;
+  receiver: Pick<User, 'id' | 'username' | 'profileImage'>;
+};import { Pool, neonConfig } from '@neondatabase/serverless';
+import { drizzle } from 'drizzle-orm/neon-serverless';
+import ws from "ws";
+import * as schema from "@shared/schema";
+
+neonConfig.webSocketConstructor = ws;
+
+if (!process.env.DATABASE_URL) {
+  throw new Error(
+    "DATABASE_URL must be set. Did you forget to provision a database?",
+  );
+}
+
+export const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+export const db = drizzle({ client: pool, schema });import * as client from "openid-client";
+import { Strategy, type VerifyFunction } from "openid-client/passport";
+
+import passport from "passport";
+import session from "express-session";
+import type { Express, RequestHandler } from "express";
+import memoize from "memoizee";
+import connectPg from "connect-pg-simple";
+import { storage } from "./storage";
+
+if (!process.env.REPLIT_DOMAINS) {
+  throw new Error("Environment variable REPLIT_DOMAINS not provided");
+}
+
+const getOidcConfig = memoize(
+  async () => {
+    return await client.discovery(
+      new URL(process.env.ISSUER_URL ?? "https://replit.com/oidc"),
+      process.env.REPL_ID!
+    );
+  },
+  { maxAge: 3600 * 1000 }
+);
+
+export function getSession() {
+  const sessionTtl = 7 * 24 * 60 * 60 * 1000; // 1 week
+  const pgStore = connectPg(session);
+  const sessionStore = new pgStore({
+    conString: process.env.DATABASE_URL,
+    createTableIfMissing: true,
+    ttl: sessionTtl,
+    tableName: "sessions",
+  });
+  return session({
+    secret: process.env.SESSION_SECRET!,
+    store: sessionStore,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      maxAge: sessionTtl,
+    },
+  });
+}
+
+function updateUserSession(
+  user: any,
+  tokens: client.TokenEndpointResponse & client.TokenEndpointResponseHelpers
+) {
+  user.claims = tokens.claims();
+  user.access_token = tokens.access_token;
+  user.refresh_token = tokens.refresh_token;
+  user.expires_at = user.claims?.exp;
+}
+
+async function upsertUser(
+  claims: any,
+) {
+  await storage.upsertUser({
+    id: claims["sub"],
+    email: claims["email"],
+    firstName: claims["first_name"],
+    lastName: claims["last_name"],
+    profileImageUrl: claims["profile_image_url"],
+  });
+}
+
+export async function setupAuth(app: Express) {
+  app.set("trust proxy", 1);
+  app.use(getSession());
+  app.use(passport.initialize());
+  app.use(passport.session());
+
+  const config = await getOidcConfig();
+
+  const verify: VerifyFunction = async (
+    tokens: client.TokenEndpointResponse & client.TokenEndpointResponseHelpers,
+    verified: passport.AuthenticateCallback
+  ) => {
+    const user = {};
+    updateUserSession(user, tokens);
+    await upsertUser(tokens.claims());
+    verified(null, user);
+  };
+
+  for (const domain of process.env
+    .REPLIT_DOMAINS!.split(",")) {
+    const strategy = new Strategy(
+      {
+        name: `replitauth:${domain}`,
+        config,
+        scope: "openid email profile offline_access",
+        callbackURL: `https://${domain}/api/callback`,
+      },
+      verify,
+    );
+    passport.use(strategy);
+  }
+
+  passport.serializeUser((user: Express.User, cb) => cb(null, user));
+  passport.deserializeUser((user: Express.User, cb) => cb(null, user));
+
+  app.get("/api/login", (req, res, next) => {
+    passport.authenticate(`replitauth:${req.hostname}`, {
+      prompt: "login consent",
+      scope: ["openid", "email", "profile", "offline_access"],
+    })(req, res, next);
+  });
+
+  app.get("/api/callback", (req, res, next) => {
+    passport.authenticate(`replitauth:${req.hostname}`, {
+      successReturnToOrRedirect: "/",
+      failureRedirect: "/api/login",
+    })(req, res, next);
+  });
+
+  app.get("/api/logout", (req, res) => {
+    req.logout(() => {
+      res.redirect(
+        client.buildEndSessionUrl(config, {
+          client_id: process.env.REPL_ID!,
+          post_logout_redirect_uri: `${req.protocol}://${req.hostname}`,
+        }).href
+      );
+    });
+  });
+}
+
+export const isAuthenticated: RequestHandler = async (req, res, next) => {
+  const user = req.user as any;
+
+  if (!req.isAuthenticated() || !user.expires_at) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  if (now <= user.expires_at) {
+    return next();
+  }
+
+  const refreshToken = user.refresh_token;
+  if (!refreshToken) {
+    res.status(401).json({ message: "Unauthorized" });
+    return;
+  }
+
+  try {
+    const config = await getOidcConfig();
+    const tokenResponse = await client.refreshTokenGrant(config, refreshToken);
+    updateUserSession(user, tokenResponse);
+    return next();
+  } catch (error) {
+    res.status(401).json({ message: "Unauthorized" });
+    return;
+  }
+};
+import { useQuery } from "@tanstack/react-query";
+
+export function useAuth() {
+  const { data: user, isLoading } = useQuery({
+    queryKey: ["/api/auth/user"],
+    retry: false,
+  });
+
+  return {
+    user,
+    isLoading,
+    isAuthenticated: !!user,
+  };
+}export function isUnauthorizedError(error: Error): boolean {
+  return /^401: .*Unauthorized/.test(error.message);
+}import {
+  pgTable,
+  text,
+  varchar,
+  timestamp,
+  jsonb,
+  index,
+  serial,
+  boolean,
+} from "drizzle-orm/pg-core";
+import { relations } from "drizzle-orm";
+import { createInsertSchema } from "drizzle-zod";
+import { z } from "zod";
+
+// Session storage table.
+// (IMPORTANT) This table is mandatory for Replit Auth, don't drop it.
+export const sessions = pgTable(
+  "sessions",
+  {
+    sid: varchar("sid").primaryKey(),
+    sess: jsonb("sess").notNull(),
+    expire: timestamp("expire").notNull(),
+  },
+  (table) => [index("IDX_session_expire").on(table.expire)],
+);
+
+// User storage table.
+// (IMPORTANT) This table is mandatory for Replit Auth, don't drop it.
+export const users = pgTable("users", {
+  id: varchar("id").primaryKey().notNull(),
+  email: varchar("email").unique(),
+  firstName: varchar("first_name"),
+  lastName: varchar("last_name"),
+  profileImageUrl: varchar("profile_image_url"),
+  isOnline: boolean("is_online").default(false),
+  lastSeen: timestamp("last_seen").defaultNow(),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+});
+
+export const messages = pgTable("messages", {
+  id: serial("id").primaryKey(),
+  senderId: varchar("sender_id").notNull().references(() => users.id),
+  receiverId: varchar("receiver_id").notNull().references(() => users.id),
+  content: text("content").notNull(),
+  messageType: varchar("message_type").notNull().default("text"), // text, image, voice
+  isRead: boolean("is_read").default(false),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+export const userRelations = relations(users, ({ many }) => ({
+  sentMessages: many(messages, { relationName: "sentMessages" }),
+  receivedMessages: many(messages, { relationName: "receivedMessages" }),
+}));
+
+export const messageRelations = relations(messages, ({ one }) => ({
+  sender: one(users, {
+    fields: [messages.senderId],
+    references: [users.id],
+    relationName: "sentMessages",
+  }),
+  receiver: one(users, {
+    fields: [messages.receiverId],
+    references: [users.id],
+    relationName: "receivedMessages",
+  }),
+}));
+
+export const insertMessageSchema = createInsertSchema(messages).omit({
+  id: true,
+  createdAt: true,
+});
+
+export const insertUserSchema = createInsertSchema(users).omit({
+  createdAt: true,
+  updatedAt: true,
+});
+
+export type UpsertUser = typeof users.$inferInsert;
+export type User = typeof users.$inferSelect;
+export type Message = typeof messages.$inferSelect;
+export type InsertMessage = z.infer<typeof insertMessageSchema>;
+import {
+  users,
+  messages,
+  type User,
+  type UpsertUser,
+  type Message,
+  type InsertMessage,
+} from "@shared/schema";
+import { db } from "./db";
+import { eq, or, and, desc } from "drizzle-orm";
+
+// Interface for storage operations
+export interface IStorage {
+  // User operations
+  // (IMPORTANT) these user operations are mandatory for Replit Auth.
+  getUser(id: string): Promise<User | undefined>;
+  upsertUser(user: UpsertUser): Promise<User>;
+  updateUserOnlineStatus(id: string, isOnline: boolean): Promise<void>;
+  getOtherUser(currentUserId: string): Promise<User | undefined>;
+  
+  // Message operations
+  createMessage(message: InsertMessage): Promise<Message>;
+  getMessages(userId1: string, userId2: string, limit?: number): Promise<Message[]>;
+  markMessageAsRead(messageId: number): Promise<void>;
+  markAllMessagesAsRead(senderId: string, receiverId: string): Promise<void>;
+}
+
+export class DatabaseStorage implements IStorage {
+  // User operations
+  // (IMPORTANT) these user operations are mandatory for Replit Auth.
+
+  async getUser(id: string): Promise<User | undefined> {
+    const [user] = await db.select().from(users).where(eq(users.id, id));
+    return user;
+  }
+
+  async upsertUser(userData: UpsertUser): Promise<User> {
+    const [user] = await db
+      .insert(users)
+      .values(userData)
+      .onConflictDoUpdate({
+        target: users.id,
+        set: {
+          ...userData,
+          updatedAt: new Date(),
+        },
+      })
+      .returning();
+    return user;
+  }
+
+  async updateUserOnlineStatus(id: string, isOnline: boolean): Promise<void> {
+    await db
+      .update(users)
+      .set({ 
+        isOnline, 
+        lastSeen: new Date(),
+        updatedAt: new Date() 
+      })
+      .where(eq(users.id, id));
+  }
+
+  async getOtherUser(currentUserId: string): Promise<User | undefined> {
+    const [user] = await db
+      .select()
+      .from(users)
+      .where(eq(users.id, currentUserId))
+      .limit(1);
+    
+    if (!user) return undefined;
+
+    // For a couple's app, get the other user (not the current one)
+    const [otherUser] = await db
+      .select()
+      .from(users)
+      .where(eq(users.id, currentUserId))
+      .limit(1);
+    
+    // Get any other user that's not the current user
+    const allUsers = await db
+      .select()
+      .from(users)
+      .limit(2);
+    
+    return allUsers.find(u => u.id !== currentUserId);
+  }
+
+  // Message operations
+  async createMessage(message: InsertMessage): Promise<Message> {
+    const [newMessage] = await db
+      .insert(messages)
+      .values(message)
+      .returning();
+    return newMessage;
+  }
+
+  async getMessages(userId1: string, userId2: string, limit = 50): Promise<Message[]> {
+    return await db
+      .select()
+      .from(messages)
+      .where(
+        or(
+          and(eq(messages.senderId, userId1), eq(messages.receiverId, userId2)),
+          and(eq(messages.senderId, userId2), eq(messages.receiverId, userId1))
+        )
+      )
+      .orderBy(desc(messages.createdAt))
+      .limit(limit);
+  }
+
+  async markMessageAsRead(messageId: number): Promise<void> {
+    await db
+      .update(messages)
+      .set({ isRead: true })
+      .where(eq(messages.id, messageId));
+  }
+
+  async markAllMessagesAsRead(senderId: string, receiverId: string): Promise<void> {
+    await db
+      .update(messages)
+      .set({ isRead: true })
+      .where(
+        and(
+          eq(messages.senderId, senderId),
+          eq(messages.receiverId, receiverId)
+        )
+      );
+  }
+}
+
+export const storage = new DatabaseStorage();
+import type { Express } from "express";
+import { createServer, type Server } from "http";
+import { WebSocketServer, WebSocket } from "ws";
+import { storage } from "./storage";
+import { setupAuth, isAuthenticated } from "./replitAuth";
+import { insertMessageSchema } from "@shared/schema";
+import { z } from "zod";
+
+interface ExtendedWebSocket extends WebSocket {
+  userId?: string;
+  isTyping?: boolean;
+}
+
+export async function registerRoutes(app: Express): Promise<Server> {
+  // Auth middleware
+  await setupAuth(app);
+
+  // Auth routes
+  app.get('/api/auth/user', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      res.json(user);
+    } catch (error) {
+      console.error("Error fetching user:", error);
+      res.status(500).json({ message: "Failed to fetch user" });
+    }
+  });
+
+  // Get partner info
+  app.get('/api/partner', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const partner = await storage.getOtherUser(userId);
+      res.json(partner);
+    } catch (error) {
+      console.error("Error fetching partner:", error);
+      res.status(500).json({ message: "Failed to fetch partner" });
+    }
+  });
+
+  // Get messages
+  app.get('/api/messages', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const partner = await storage.getOtherUser(userId);
+      
+      if (!partner) {
+        return res.status(404).json({ message: "Partner not found" });
+      }
+
+      const messages = await storage.getMessages(userId, partner.id);
+      res.json(messages.reverse()); // Return in chronological order
+    } catch (error) {
+      console.error("Error fetching messages:", error);
+      res.status(500).json({ message: "Failed to fetch messages" });
+    }
+  });
+
+  // Send message
+  app.post('/api/messages', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const partner = await storage.getOtherUser(userId);
+      
+      if (!partner) {
+        return res.status(404).json({ message: "Partner not found" });
+      }
+
+      const messageData = insertMessageSchema.parse({
+        ...req.body,
+        senderId: userId,
+        receiverId: partner.id,
+      });
+
+      const message = await storage.createMessage(messageData);
+      
+      // Broadcast to connected WebSocket clients
+      wss.clients.forEach((client: ExtendedWebSocket) => {
+        if (client.readyState === WebSocket.OPEN && 
+            (client.userId === userId || client.userId === partner.id)) {
+          client.send(JSON.stringify({
+            type: 'new_message',
+            data: message
+          }));
+        }
+      });
+
+      res.json(message);
+    } catch (error) {
+      console.error("Error sending message:", error);
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({ message: "Invalid message data", errors: error.errors });
+      }
+      res.status(500).json({ message: "Failed to send message" });
+    }
+  });
+
+  // Mark messages as read
+  app.patch('/api/messages/read', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const partner = await storage.getOtherUser(userId);
+      
+      if (!partner) {
+        return res.status(404).json({ message: "Partner not found" });
+      }
+
+      await storage.markAllMessagesAsRead(partner.id, userId);
+      res.json({ success: true });
+    } catch (error) {
+      console.error("Error marking messages as read:", error);
+      res.status(500).json({ message: "Failed to mark messages as read" });
+    }
+  });
+
+  const httpServer = createServer(app);
+
+  // WebSocket server setup
+  const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
+
+  wss.on('connection', (ws: ExtendedWebSocket, req) => {
+    console.log('WebSocket connection established');
+
+    ws.on('message', async (data) => {
+      try {
+        const message = JSON.parse(data.toString());
+
+        switch (message.type) {
+          case 'auth':
+            ws.userId = message.userId;
+            await storage.updateUserOnlineStatus(message.userId, true);
+            
+            // Broadcast online status to partner
+            const partner = await storage.getOtherUser(message.userId);
+            if (partner) {
+              wss.clients.forEach((client: ExtendedWebSocket) => {
+                if (client.readyState === WebSocket.OPEN && client.userId === partner.id) {
+                  client.send(JSON.stringify({
+                    type: 'user_online',
+                    data: { userId: message.userId, isOnline: true }
+                  }));
+                }
+              });
+            }
+            break;
+
+          case 'typing_start':
+            ws.isTyping = true;
+            wss.clients.forEach((client: ExtendedWebSocket) => {
+              if (client.readyState === WebSocket.OPEN && 
+                  client.userId !== ws.userId) {
+                client.send(JSON.stringify({
+                  type: 'typing_start',
+                  data: { userId: ws.userId }
+                }));
+              }
+            });
+            break;
+
+          case 'typing_stop':
+            ws.isTyping = false;
+            wss.clients.forEach((client: ExtendedWebSocket) => {
+              if (client.readyState === WebSocket.OPEN && 
+                  client.userId !== ws.userId) {
+                client.send(JSON.stringify({
+                  type: 'typing_stop',
+                  data: { userId: ws.userId }
+                }));
+              }
+            });
+            break;
+        }
+      } catch (error) {
+        console.error('WebSocket message error:', error);
+      }
+    });
+
+    ws.on('close', async () => {
+      if (ws.userId) {
+        await storage.updateUserOnlineStatus(ws.userId, false);
+        
+        // Broadcast offline status to partner
+        const partner = await storage.getOtherUser(ws.userId);
+        if (partner) {
+          wss.clients.forEach((client: ExtendedWebSocket) => {
+            if (client.readyState === WebSocket.OPEN && client.userId === partner.id) {
+              client.send(JSON.stringify({
+                type: 'user_offline',
+                data: { userId: ws.userId, isOnline: false }
+              }));
+            }
+          });
+        }
+      }
+    });
+  });
+
+  return httpServer;
+}import { useEffect, useRef, useState, useCallback } from 'react';
+import { useAuth } from './useAuth';
+
+interface SocketMessage {
+  type: string;
+  data: any;
+}
+
+export function useSocket() {
+  const { user, isAuthenticated } = useAuth();
+  const socketRef = useRef<WebSocket | null>(null);
+  const [isConnected, setIsConnected] = useState(false);
+  const [lastMessage, setLastMessage] = useState<SocketMessage | null>(null);
+
+  const sendMessage = useCallback((message: any) => {
+    if (socketRef.current?.readyState === WebSocket.OPEN) {
+      socketRef.current.send(JSON.stringify(message));
+    }
+  }, []);
+
+  const sendTypingStart = useCallback(() => {
+    sendMessage({ type: 'typing_start' });
+  }, [sendMessage]);
+
+  const sendTypingStop = useCallback(() => {
+    sendMessage({ type: 'typing_stop' });
+  }, [sendMessage]);
+
+  useEffect(() => {
+    if (!isAuthenticated || !user) return;
+
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const wsUrl = `${protocol}//${window.location.host}/ws`;
+    
+    const socket = new WebSocket(wsUrl);
+    socketRef.current = socket;
+
+    socket.onopen = () => {
+      setIsConnected(true);
+      // Authenticate the socket connection
+      socket.send(JSON.stringify({
+        type: 'auth',
+        userId: user.id
+      }));
+    };
+
+    socket.onmessage = (event) => {
+      try {
+        const message = JSON.parse(event.data);
+        setLastMessage(message);
+      } catch (error) {
+        console.error('Failed to parse WebSocket message:', error);
+      }
+    };
+
+    socket.onclose = () => {
+      setIsConnected(false);
+    };
+
+    socket.onerror = (error) => {
+      console.error('WebSocket error:', error);
+      setIsConnected(false);
+    };
+
+    return () => {
+      socket.close();
+    };
+  }, [isAuthenticated, user]);
+
+  return {
+    isConnected,
+    lastMessage,
+    sendMessage,
+    sendTypingStart,
+    sendTypingStop,
+  };
+}
+import { Card, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Heart } from "lucide-react";
+
+export default function Landing() {
+  const handleLogin = () => {
+    window.location.href = "/api/login";
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-primary/10 to-secondary/10 p-4">
+      <Card className="w-full max-w-md shadow-2xl">
+        <CardContent className="pt-8 pb-8">
+          <div className="text-center mb-8">
+            <div className="inline-flex items-center justify-center w-16 h-16 bg-primary rounded-full mb-4">
+              <Heart className="text-white text-2xl" fill="currentColor" />
+            </div>
+            <h1 className="text-2xl font-bold text-text-dark mb-2">HeartChat</h1>
+            <p className="text-accent text-sm">Your private space for intimate conversations</p>
+          </div>
+          
+          <Button 
+            onClick={handleLogin}
+            className="w-full bg-primary text-white py-3 rounded-xl font-medium hover:bg-primary/90 transition-colors duration-200 flex items-center justify-center space-x-2"
+          >
+            <span>Sign In</span>
+            <Heart className="text-sm" fill="currentColor" />
+          </Button>
+          
+          <div className="mt-6 text-center">
+            <p className="text-sm text-accent">
+              Sign in to connect with your partner
+            </p>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}import { useEffect, useState } from 'react';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useAuth } from '@/hooks/useAuth';
+import { useSocket } from '@/hooks/useSocket';
+import { useToast } from '@/hooks/use-toast';
+import { isUnauthorizedError } from '@/lib/authUtils';
+import { apiRequest } from '@/lib/queryClient';
+import ChatHeader from '@/components/chat/ChatHeader';
+import MessageBubble from '@/components/chat/MessageBubble';
+import MessageInput from '@/components/chat/MessageInput';
+import TypingIndicator from '@/components/chat/TypingIndicator';
+import { Loader2 } from 'lucide-react';
+import type { Message, User } from '@shared/schema';
+
+export default function Chat() {
+  const { user, isAuthenticated, isLoading: authLoading } = useAuth();
+  const { lastMessage, sendTypingStart, sendTypingStop } = useSocket();
+  const { toast } = useToast();
+  const queryClient = useQueryClient();
+  const [isPartnerTyping, setIsPartnerTyping] = useState(false);
+  const [partnerOnlineStatus, setPartnerOnlineStatus] = useState(false);
+
+  // Redirect to home if not authenticated
+  useEffect(() => {
+    if (!authLoading && !isAuthenticated) {
+      toast({
+        title: "Unauthorized",
+        description: "You are logged out. Logging in again...",
+        variant: "destructive",
+      });
+      setTimeout(() => {
+        window.location.href = "/api/login";
+      }, 500);
+      return;
+    }
+  }, [isAuthenticated, authLoading, toast]);
+
+  // Fetch partner info
+  const { data: partner, isLoading: partnerLoading } = useQuery({
+    queryKey: ['/api/partner'],
+    enabled: isAuthenticated,
+    retry: false,
+  });
+
+  // Fetch messages
+  const { data: messages = [], isLoading: messagesLoading } = useQuery({
+    queryKey: ['/api/messages'],
+    enabled: isAuthenticated,
+    retry: false,
+  });
+
+  // Send message mutation
+  const sendMessageMutation = useMutation({
+    mutationFn: async (messageData: { content: string; messageType?: string }) => {
+      await apiRequest('POST', '/api/messages', messageData);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['/api/messages'] });
+    },
+    onError: (error) => {
+      if (isUnauthorizedError(error as Error)) {
+        toast({
+          title: "Unauthorized",
+          description: "You are logged out. Logging in again...",
+          variant: "destructive",
+        });
+        setTimeout(() => {
+          window.location.href = "/api/login";
+        }, 500);
+        return;
+      }
+      toast({
+        title: "Error",
+        description: "Failed to send message. Please try again.",
+        variant: "destructive",
+      });
+    },
+  });
+
+  // Mark messages as read mutation
+  const markAsReadMutation = useMutation({
+    mutationFn: async () => {
+      await apiRequest('PATCH', '/api/messages/read');
+    },
+    onError: (error) => {
+      if (isUnauthorizedError(error as Error)) {
+        toast({
+          title: "Unauthorized",
+          description: "You are logged out. Logging in again...",
+          variant: "destructive",
+        });
+        setTimeout(() => {
+          window.location.href = "/api/login";
+        }, 500);
+        return;
+      }
+    },
+  });
+
+  // Handle WebSocket messages
+  useEffect(() => {
+    if (!lastMessage) return;
+
+    switch (lastMessage.type) {
+      case 'new_message':
+        queryClient.invalidateQueries({ queryKey: ['/api/messages'] });
+        // Mark as read if the user is active
+        markAsReadMutation.mutate();
+        break;
+      case 'typing_start':
+        setIsPartnerTyping(true);
+        break;
+      case 'typing_stop':
+        setIsPartnerTyping(false);
+        break;
+      case 'user_online':
+        setPartnerOnlineStatus(true);
+        break;
+      case 'user_offline':
+        setPartnerOnlineStatus(false);
+        break;
+    }
+  }, [lastMessage, queryClient, markAsReadMutation]);
+
+  // Auto-scroll to bottom when new messages arrive
+  useEffect(() => {
+    const messagesContainer = document.querySelector('.messages-container');
+    if (messagesContainer) {
+      messagesContainer.scrollTop = messagesContainer.scrollHeight;
+    }
+  }, [messages]);
+
+  // Handle sending messages
+  const handleSendMessage = (content: string) => {
+    if (!content.trim()) return;
+    sendMessageMutation.mutate({ content: content.trim() });
+  };
+
+  // Handle typing indicators
+  const handleTypingStart = () => {
+    sendTypingStart();
+  };
+
+  const handleTypingStop = () => {
+    sendTypingStop();
+  };
+
+  if (authLoading || partnerLoading || messagesLoading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-bg-light">
+        <Loader2 className="h-8 w-8 animate-spin text-primary" />
+      </div>
+    );
+  }
+
+  if (!partner) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-bg-light">
+        <div className="text-center">
+          <p className="text-accent">No partner found. Please contact support.</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col h-screen bg-bg-light">
+      <ChatHeader 
+        partner={partner} 
+        isOnline={partner.isOnline || partnerOnlineStatus}
+        lastSeen={partner.lastSeen}
+      />
+      
+      <div className="flex-1 overflow-y-auto px-4 py-6 space-y-4 messages-container">
+        {/* Date separator */}
+        <div className="flex justify-center">
+          <span className="bg-white px-3 py-1 rounded-full text-xs text-accent border">
+            Today
+          </span>
+        </div>
+        
+        {messages.map((message: Message) => (
+          <MessageBubble
+            key={message.id}
+            message={message}
+            isOwnMessage={message.senderId === user?.id}
+            partner={partner}
+          />
+        ))}
+        
+        {isPartnerTyping && <TypingIndicator partner={partner} />}
+      </div>
+      
+      <MessageInput
+        onSendMessage={handleSendMessage}
+        onTypingStart={handleTypingStart}
+        onTypingStop={handleTypingStop}
+        isLoading={sendMessageMutation.isPending}
+      />
+    </div>
+  );
+}import { Button } from '@/components/ui/button';
+import { Video, Phone, MoreVertical } from 'lucide-react';
+import { formatDistanceToNow } from 'date-fns';
+import type { User } from '@shared/schema';
+
+interface ChatHeaderProps {
+  partner: User;
+  isOnline: boolean;
+  lastSeen: string | null;
+}
+
+export default function ChatHeader({ partner, isOnline, lastSeen }: ChatHeaderProps) {
+  const getStatusText = () => {
+    if (isOnline) return "Online • Last seen now";
+    if (lastSeen) {
+      return `Last seen ${formatDistanceToNow(new Date(lastSeen), { addSuffix: true })}`;
+    }
+    return "Offline";
+  };
+
+  const getDisplayName = () => {
+    if (partner.firstName && partner.lastName) {
+      return `${partner.firstName} ${partner.lastName} ❤️`;
+    }
+    if (partner.firstName) {
+      return `${partner.firstName} ❤️`;
+    }
+    return "My Love ❤️";
+  };
+
+  const handleLogout = () => {
+    window.location.href = "/api/logout";
+  };
+
+  return (
+    <header className="bg-white border-b border-gray-200 px-4 py-3 flex items-center justify-between shadow-sm">
+      <div className="flex items-center space-x-3">
+        <div className="relative">
+          <img
+            src={partner.profileImageUrl || "https://images.unsplash.com/photo-1516589178581-6cd7833ae3b2?ixlib=rb-4.0.3&auto=format&fit=crop&w=150&h=150"}
+            alt="Partner avatar"
+            className="w-10 h-10 rounded-full object-cover border-2 border-primary/20"
+          />
+          <div 
+            className={`absolute -bottom-1 -right-1 w-4 h-4 border-2 border-white rounded-full ${
+              isOnline ? 'bg-green-500' : 'bg-gray-400'
+            }`}
+          />
+        </div>
+        <div>
+          <h2 className="font-semibold text-text-dark">{getDisplayName()}</h2>
+          <p className="text-xs text-accent">{getStatusText()}</p>
+        </div>
+      </div>
+      
+      <div className="flex items-center space-x-3">
+        <Button
+          variant="ghost"
+          size="sm"
+          className="p-2 hover:bg-gray-100 rounded-full transition-colors duration-200"
+        >
+          <Video className="h-4 w-4 text-accent" />
+        </Button>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="p-2 hover:bg-gray-100 rounded-full transition-colors duration-200"
+        >
+          <Phone className="h-4 w-4 text-accent" />
+        </Button>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="p-2 hover:bg-gray-100 rounded-full transition-colors duration-200"
+          onClick={handleLogout}
+        >
+          <MoreVertical className="h-4 w-4 text-accent" />
+        </Button>
+      </div>
+    </header>
+  );
+}import { formatDistanceToNow, format } from 'date-fns';
+import { Check, CheckCheck } from 'lucide-react';
+import type { Message, User } from '@shared/schema';
+
+interface MessageBubbleProps {
+  message: Message;
+  isOwnMessage: boolean;
+  partner: User;
+}
+
+export default function MessageBubble({ message, isOwnMessage, partner }: MessageBubbleProps) {
+  const formatTime = (date: string) => {
+    const messageDate = new Date(date);
+    const now = new Date();
+    const diffInHours = (now.getTime() - messageDate.getTime()) / (1000 * 60 * 60);
+    
+    if (diffInHours < 24) {
+      return format(messageDate, 'h:mm a');
+    }
+    return format(messageDate, 'MMM d, h:mm a');
+  };
+
+  if (isOwnMessage) {
+    return (
+      <div className="flex items-start space-x-2 max-w-xs ml-auto flex-row-reverse">
+        <div className="bg-primary rounded-2xl rounded-br-md px-4 py-3 shadow-sm">
+          <p className="text-white text-sm">{message.content}</p>
+          <div className="flex items-center justify-end mt-2 space-x-1">
+            <span className="text-xs text-pink-100">
+              {formatTime(message.createdAt!)}
+            </span>
+            {message.isRead ? (
+              <CheckCheck className="h-3 w-3 text-pink-100" />
+            ) : (
+              <Check className="h-3 w-3 text-pink-100" />
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex items-start space-x-2 max-w-xs">
+      <img
+        src={partner.profileImageUrl || "https://images.unsplash.com/photo-1516589178581-6cd7833ae3b2?ixlib=rb-4.0.3&auto=format&fit=crop&w=150&h=150"}
+        alt="Partner"
+        className="w-8 h-8 rounded-full object-cover flex-shrink-0"
+      />
+      <div className="bg-white rounded-2xl rounded-bl-md px-4 py-3 shadow-sm border">
+        <p className="text-text-dark text-sm">{message.content}</p>
+        <div className="flex items-center justify-between mt-2">
+          <span className="text-xs text-accent">
+            {formatTime(message.createdAt!)}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}import { useState, useRef, useEffect } from 'react';
+import { Button } from '@/components/ui/button';
+import { Textarea } from '@/components/ui/textarea';
+import { Paperclip, Smile, Heart, Mic } from 'lucide-react';
+
+interface MessageInputProps {
+  onSendMessage: (content: string) => void;
+  onTypingStart: () => void;
+  onTypingStop: () => void;
+  isLoading: boolean;
+}
+
+export default function MessageInput({ 
+  onSendMessage, 
+  onTypingStart, 
+  onTypingStop, 
+  isLoading 
+}: MessageInputProps) {
+  const [message, setMessage] = useState('');
+  const [isTyping, setIsTyping] = useState(false);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const typingTimeoutRef = useRef<NodeJS.Timeout>();
+
+  // Auto-resize textarea
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (textarea) {
+      textarea.style.height = 'auto';
+      textarea.style.height = Math.min(textarea.scrollHeight, 128) + 'px';
+    }
+  }, [message]);
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const value = e.target.value;
+    setMessage(value);
+
+    // Handle typing indicators
+    if (value && !isTyping) {
+      setIsTyping(true);
+      onTypingStart();
+    }
+
+    // Clear existing timeout
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current);
+    }
+
+    // Set new timeout to stop typing indicator
+    typingTimeoutRef.current = setTimeout(() => {
+      if (isTyping) {
+        setIsTyping(false);
+        onTypingStop();
+      }
+    }, 1000);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
+
+  const handleSend = () => {
+    if (!message.trim() || isLoading) return;
+
+    onSendMessage(message);
+    setMessage('');
+    
+    // Stop typing indicator
+    if (isTyping) {
+      setIsTyping(false);
+      onTypingStop();
+    }
+    
+    // Clear timeout
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current);
+    }
+  };
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (typingTimeoutRef.current) {
+        clearTimeout(typingTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  return (
+    <div className="bg-white border-t border-gray-200 px-4 py-3">
+      <div className="flex items-end space-x-3">
+        <Button
+          variant="ghost"
+          size="sm"
+          className="p-2 hover:bg-gray-100 rounded-full transition-colors duration-200 flex-shrink-0"
+        >
+          <Paperclip className="h-4 w-4 text-accent" />
+        </Button>
+        
+        <div className="flex-1 relative">
+          <Textarea
+            ref={textareaRef}
+            placeholder="Type your message..."
+            value={message}
+            onChange={handleInputChange}
+            onKeyDown={handleKeyDown}
+            className="w-full resize-none rounded-2xl border border-gray-300 px-4 py-3 pr-12 focus:ring-2 focus:ring-primary focus:border-transparent transition-all duration-200 text-sm max-h-32"
+            rows={1}
+            disabled={isLoading}
+          />
+          
+          <Button
+            variant="ghost"
+            size="sm"
+            className="absolute right-2 bottom-2 p-2 hover:bg-gray-100 rounded-full transition-colors duration-200"
+          >
+            <Smile className="h-4 w-4 text-accent" />
+          </Button>
+        </div>
+        
+        <Button
+          onClick={handleSend}
+          disabled={!message.trim() || isLoading}
+          className="bg-primary text-white p-3 rounded-full hover:bg-primary/90 transition-colors duration-200 flex-shrink-0"
+        >
+          <Heart className="h-4 w-4" fill="currentColor" />
+        </Button>
+      </div>
+      
+      {/* Voice Message Button (when text is empty) */}
+      {!message.trim() && (
+        <div className="flex items-center justify-center mt-2">
+          <Button
+            variant="outline"
+            className="bg-secondary text-white px-6 py-2 rounded-full hover:bg-secondary/90 transition-colors duration-200 flex items-center space-x-2"
+          >
+            <Mic className="h-4 w-4" />
+            <span className="text-sm font-medium">Hold to record</span>
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}import type { User } from '@shared/schema';
+
+interface TypingIndicatorProps {
+  partner: User;
+}
+
+export default function TypingIndicator({ partner }: TypingIndicatorProps) {
+  return (
+    <div className="flex items-start space-x-2 max-w-xs">
+      <img
+        src={partner.profileImageUrl || "https://images.unsplash.com/photo-1516589178581-6cd7833ae3b2?ixlib=rb-4.0.3&auto=format&fit=crop&w=150&h=150"}
+        alt="Partner"
+        className="w-8 h-8 rounded-full object-cover flex-shrink-0"
+      />
+      <div className="bg-white rounded-2xl rounded-bl-md px-4 py-3 shadow-sm border">
+        <div className="flex space-x-1">
+          <div className="w-2 h-2 bg-accent rounded-full animate-bounce"></div>
+          <div className="w-2 h-2 bg-accent rounded-full animate-bounce" style={{ animationDelay: '0.1s' }}></div>
+          <div className="w-2 h-2 bg-accent rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></div>
+        </div>
+      </div>
+    </div>
+  );
+}import { Switch, Route } from "wouter";
+import { queryClient } from "./lib/queryClient";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { Toaster } from "@/components/ui/toaster";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { useAuth } from "@/hooks/useAuth";
+import NotFound from "@/pages/not-found";
+import Landing from "@/pages/landing";
+import Chat from "@/pages/chat";
+
+function Router() {
+  const { isAuthenticated, isLoading } = useAuth();
+
+  return (
+    <Switch>
+      {isLoading || !isAuthenticated ? (
+        <Route path="/" component={Landing} />
+      ) : (
+        <>
+          <Route path="/" component={Chat} />
+        </>
+      )}
+      <Route component={NotFound} />
+    </Switch>
+  );
+}
+
+function App() {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <TooltipProvider>
+        <Toaster />
+        <Router />
+      </TooltipProvider>
+    </QueryClientProvider>
+  );
+}
+
+export default App;
+import express, { type Express } from "express";
+import fs from "fs";
+import path from "path";
+import { createServer as createViteServer, createLogger } from "vite";
+import { type Server } from "http";
+import viteConfig from "../vite.config";
+import { nanoid } from "nanoid";
+
+const viteLogger = createLogger();
+
+export function log(message: string, source = "express") {
+  const formattedTime = new Date().toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true,
+  });
+
+  console.log(`${formattedTime} [${source}] ${message}`);
+}
+
+export async function setupVite(app: Express, server: Server) {
+  const serverOptions = {
+    middlewareMode: true,
+    hmr: { server },
+    allowedHosts: true,
+  };
+
+  const vite = await createViteServer({
+    ...viteConfig,
+    configFile: false,
+    customLogger: {
+      ...viteLogger,
+      error: (msg, options) => {
+        viteLogger.error(msg, options);
+        process.exit(1);
+      },
+    },
+    server: serverOptions,
+    appType: "custom",
+  });
+
+  app.use(vite.middlewares);
+  app.use("*", async (req, res, next) => {
+    const url = req.originalUrl;
+
+    try {
+      const clientTemplate = path.resolve(
+        import.meta.dirname,
+        "..",
+        "client",
+        "index.html",
+      );
+
+      // always reload the index.html file from disk incase it changes
+      let template = await fs.promises.readFile(clientTemplate, "utf-8");
+      template = template.replace(
+        `src="/src/main.tsx"`,
+        `src="/src/main.tsx?v=${nanoid()}"`,
+      );
+      const page = await vite.transformIndexHtml(url, template);
+      res.status(200).set({ "Content-Type": "text/html" }).end(page);
+    } catch (e) {
+      vite.ssrFixStacktrace(e as Error);
+      next(e);
+    }
+  });
+}
+
+export function serveStatic(app: Express) {
+  const distPath = path.resolve(import.meta.dirname, "public");
+
+  if (!fs.existsSync(distPath)) {
+    throw new Error(
+      `Could not find the build directory: ${distPath}, make sure to build the client first`,
+    );
+  }
+
+  app.use(express.static(distPath));
+
+  // fall through to index.html if the file doesn't exist
+  app.use("*", (_req, res) => {
+    res.sendFile(path.resolve(distPath, "index.html"));
+  });
+}
